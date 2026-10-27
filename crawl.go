@@ -33,6 +33,7 @@ func crawlSite(o CrawlOptions) error {
 		"--no-parent",
 		"--delete-after",
 		"--no-warc-keep-log",
+		"--no-verbose",
 		"--warc-file=" + o.WarcBase,
 		"--warc-cdx",
 		"-P", o.Scratch,

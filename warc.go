@@ -133,6 +133,10 @@ func parseResponse(rec *WARCRecord) (*WARCResponse, error) {
 		return nil, nil
 	}
 	target := rec.Header["warc-target-uri"]
+	// The WARC grammar wraps the target in angle brackets: <http://host/path>.
+	if strings.HasPrefix(target, "<") && strings.HasSuffix(target, ">") {
+		target = target[1 : len(target)-1]
+	}
 	payload := rec.Payload
 
 	idx := bytes.Index(payload, []byte("\r\n\r\n"))

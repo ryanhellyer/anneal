@@ -180,26 +180,49 @@ func runPipeline(args []string) int {
 
 	// Reuse the WARC from a previous run instead of re-crawling. This is what
 	// lets you "run it again" after an interruption without starting the fetch
-	// over; --recrawl forces a fresh crawl.
+	// over; --recrawl forces a fresh crawl. A WARC is only reused for the same
+	// origin, so changing --url with the same --path does not serve stale bytes.
 	var warcPath string
-	if existing := findWARC(warcBase); existing != "" && !recrawl {
-		fmt.Fprintf(os.Stderr, "anneal: reusing existing WARC %s (use --recrawl to fetch again)\n", existing)
+	existing := findWARC(warcBase)
+	reuse := false
+	if existing != "" && !recrawl {
+		if prev := warcOrigin(warcBase); prev == "" || prev == origin {
+			reuse = true
+			fmt.Fprintf(os.Stderr, "anneal: reusing existing WARC %s (use --recrawl to fetch again)\n", existing)
+		} else {
+			fmt.Fprintf(os.Stderr, "anneal: existing WARC is for %s, not %s; crawling fresh\n", prev, origin)
+		}
+	}
+	if reuse {
 		warcPath = existing
 	} else {
-		removeWARC(warcBase)
+		// Crawl to a temporary WARC and move it into place only on success, so
+		// a failed recrawl never destroys the previous WARC.
+		tmpBase := warcBase + ".partial"
+		removeWARC(tmpBase)
+		defer removeWARC(tmpBase)
 		fmt.Fprintf(os.Stderr, "anneal: crawling %s\n", normURL)
-		warcPath, err = crawlSite(CrawlOptions{
+		tmp, err := crawlSite(CrawlOptions{
 			Origin:       normURL,
-			WarcBase:     warcBase,
+			WarcBase:     tmpBase,
 			Scratch:      dir,
 			Seeds:        seeds,
 			IgnoreRobots: ignoreRobots,
 		})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "anneal: crawl failed: %v\n", err)
+			if existing != "" {
+				fmt.Fprintf(os.Stderr, "anneal: kept the previous WARC at %s\n", existing)
+			}
+			return 1
+		}
+		warcPath, err = installWARC(tmp, warcBase)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "anneal: %v\n", err)
 			return 1
 		}
 	}
+	writeWarcOrigin(warcBase, origin)
 
 	mime, err := loadMime(mimePath)
 	if err != nil {
@@ -283,4 +306,36 @@ func warcBaseFor(dest string) string {
 	dest = strings.TrimSuffix(dest, ".gz")
 	dest = strings.TrimSuffix(dest, ".warc")
 	return dest
+}
+
+// warcOrigin reads the origin a WARC was crawled from (sidecar next to it).
+func warcOrigin(base string) string {
+	b, err := os.ReadFile(base + ".origin")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func writeWarcOrigin(base, origin string) {
+	_ = os.WriteFile(base+".origin", []byte(origin+"\n"), 0o644)
+}
+
+// installWARC moves a freshly crawled WARC (and its CDX) into its final place,
+// so the move is atomic within the directory and a failed recrawl keeps the
+// previous WARC intact.
+func installWARC(tmp, warcBase string) (string, error) {
+	ext := ".warc.gz"
+	if !strings.HasSuffix(tmp, ".warc.gz") {
+		ext = ".warc"
+	}
+	dest := warcBase + ext
+	if err := os.Rename(tmp, dest); err != nil {
+		return "", fmt.Errorf("installing WARC: %w", err)
+	}
+	tmpCdx := strings.TrimSuffix(tmp, ext) + ".cdx"
+	if _, err := os.Stat(tmpCdx); err == nil {
+		_ = os.Rename(tmpCdx, warcBase+".cdx")
+	}
+	return dest, nil
 }

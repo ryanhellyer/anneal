@@ -123,6 +123,8 @@ func isServerError(err error) bool {
 func removeWARC(base string) {
 	os.Remove(base + ".warc.gz")
 	os.Remove(base + ".warc")
+	os.Remove(base + ".cdx")
+	os.Remove(base + ".origin")
 }
 
 // findWARC returns the WARC wget wrote: compressed by default, but some builds

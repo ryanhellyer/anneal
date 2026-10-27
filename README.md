@@ -46,6 +46,7 @@ to `nginx/mime.types` and re-run).
 --seed URL        extra seed URL (sitemap.xml, access-log URLs, ...), repeatable
 --warc PATH       write the WARC somewhere other than <path>/nginx/site.warc.gz
 --no-warc         discard the WARC
+--recrawl         crawl again even if a WARC already exists (default: reuse it)
 --mime PATH       use a specific nginx/mime.types
 --ignore-robots   do not honour robots.txt (only on a server you own)
 --wipe            delete --path first (refused if it is not a safe output root)
@@ -55,6 +56,27 @@ to `nginx/mime.types` and re-run).
 Nothing is written outside `--path` unless you ask for it. The WARC is written
 straight to `<path>/nginx/site.warc.gz` (no copy step); `wget`'s transient
 page downloads go to `<path>/.anneal-crawl`, which is removed when the run ends.
+
+## Re-running and getting stuck
+
+The crawl does not resume mid-download — no recursive WARC crawler does that
+well. But re-running is safe and cheap once a crawl has produced a WARC:
+
+- **If a WARC already exists for the same origin, Anneal reuses it** and goes
+  straight to materialise. So if the crawl was interrupted (or the site went
+  away), run the same command again and it finishes from the WARC it already has
+  instead of downloading again.
+- A WARC tagged with a different origin is not reused; changing `--url` with the
+  same `--path` crawls fresh rather than serving stale bytes.
+- **A failed `--recrawl` never destroys the previous WARC** — the new crawl is
+  written alongside and moved into place only on success.
+- A WARC killed mid-record still materialises everything before the truncated
+  tail (with a warning), so a stuck crawl is not a total loss.
+- The crawl is bounded: `--timeout=30`, `--tries=3`, `--waitretry=5`, so a dead
+  connection cannot hang it forever.
+
+To force a completely fresh fetch, pass `--recrawl`.
+
 
 ### Stages
 

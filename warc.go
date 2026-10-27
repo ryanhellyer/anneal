@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -53,6 +54,12 @@ func readWARC(path string, fn func(*WARCRecord) error) error {
 			return nil
 		}
 		if err != nil {
+			// A crawl killed mid-record leaves a truncated final record. Keep
+			// everything before it rather than failing the whole file.
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				fmt.Fprintf(os.Stderr, "anneal: warning: WARC ends with a truncated record; ignoring the tail\n")
+				return nil
+			}
 			return err
 		}
 		if rec == nil {

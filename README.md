@@ -44,13 +44,17 @@ to `nginx/mime.types` and re-run).
 
 ```
 --seed URL        extra seed URL (sitemap.xml, access-log URLs, ...), repeatable
---warc PATH       copy the WARC somewhere other than <path>/nginx/site.warc.gz
+--warc PATH       write the WARC somewhere other than <path>/nginx/site.warc.gz
 --no-warc         discard the WARC
 --mime PATH       use a specific nginx/mime.types
 --ignore-robots   do not honour robots.txt (only on a server you own)
 --wipe            delete --path first (refused if it is not a safe output root)
---scratch DIR     crawl scratch directory (default: a temp dir)
+--scratch DIR     crawl scratch dir (default: <path>/.anneal-crawl, removed after)
 ```
+
+Nothing is written outside `--path` unless you ask for it. The WARC is written
+straight to `<path>/nginx/site.warc.gz` (no copy step); `wget`'s transient
+page downloads go to `<path>/.anneal-crawl`, which is removed when the run ends.
 
 ### Stages
 

@@ -41,12 +41,13 @@ Flags for the full pipeline:
   --url    seed URL (required)
   --path   directory to write the site into (default "./")
   --seed   extra seed URL, repeatable (sitemap.xml, access-log URLs, ...)
-  --warc   copy the crawl WARC to this path
+  --warc   write the crawl WARC to this path (default <path>/nginx/site.warc.gz)
   --no-warc        discard the WARC instead of keeping it
+  --recrawl        crawl again even if a WARC already exists (default: reuse it)
   --mime   path to nginx/mime.types (default: search, or embedded copy)
   --ignore-robots  do not honour robots.txt (only on a server you own)
   --wipe           delete --path before writing (checked: must be absolute-ish)
-  --scratch        directory for crawl scratch (default: a temp dir)
+  --scratch        crawl scratch dir (default: <path>/.anneal-crawl, removed after)
 `)
 }
 
@@ -95,16 +96,18 @@ func runPipeline(args []string) int {
 		noWarc       bool
 		ignoreRobots bool
 		wipe         bool
+		recrawl      bool
 		seeds        stringList
 	)
 	fs.StringVar(&rawURL, "url", "", "seed URL to crawl (required)")
 	fs.StringVar(&path, "path", "./", "directory to write the site into")
-	fs.StringVar(&warcDest, "warc", "", "copy the crawl WARC to this path")
+	fs.StringVar(&warcDest, "warc", "", "write the crawl WARC to this path")
 	fs.StringVar(&mimePath, "mime", "", "path to nginx/mime.types")
-	fs.StringVar(&scratch, "scratch", "", "crawl scratch directory (default: temp)")
+	fs.StringVar(&scratch, "scratch", "", "crawl scratch dir (default: <path>/.anneal-crawl)")
 	fs.BoolVar(&noWarc, "no-warc", false, "discard the WARC instead of keeping it")
 	fs.BoolVar(&ignoreRobots, "ignore-robots", false, "do not honour robots.txt")
 	fs.BoolVar(&wipe, "wipe", false, "delete --path before writing")
+	fs.BoolVar(&recrawl, "recrawl", false, "crawl again even if a WARC already exists")
 	fs.Var(&seeds, "seed", "extra seed URL (repeatable)")
 
 	if err := fs.Parse(args); err != nil {
@@ -135,41 +138,67 @@ func runPipeline(args []string) int {
 			return 2
 		}
 	}
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	if err := os.MkdirAll(out, 0o755); err != nil {
 		fmt.Fprintf(os.Stderr, "anneal: %v\n", err)
 		return 1
 	}
 
+	// wget needs scratch space for the pages it downloads before deleting them
+	// (--delete-after). By default that lives inside --path, not /tmp, and is
+	// removed when we are done. Override with --scratch to keep it elsewhere.
 	dir := scratch
+	ownScratch := false
 	if dir == "" {
-		dir, err = os.MkdirTemp("", "anneal-*")
+		dir = filepath.Join(root, ".anneal-crawl")
+		ownScratch = true
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "anneal: %v\n", err)
+		return 1
+	}
+	if ownScratch {
+		defer os.RemoveAll(dir)
+	}
+
+	// The WARC is written straight to where it will be kept - no copy step.
+	// Default: <out>/site.warc.gz. --warc points elsewhere; --no-warc uses
+	// scratch and discards it.
+	var warcBase, warcDir string
+	switch {
+	case noWarc:
+		warcBase, warcDir = filepath.Join(dir, "site"), dir
+	case warcDest != "":
+		warcBase = warcBaseFor(warcDest)
+		warcDir = filepath.Dir(warcBase)
+	default:
+		warcBase, warcDir = filepath.Join(out, "site"), out
+	}
+	if err := os.MkdirAll(warcDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "anneal: %v\n", err)
+		return 1
+	}
+
+	// Reuse the WARC from a previous run instead of re-crawling. This is what
+	// lets you "run it again" after an interruption without starting the fetch
+	// over; --recrawl forces a fresh crawl.
+	var warcPath string
+	if existing := findWARC(warcBase); existing != "" && !recrawl {
+		fmt.Fprintf(os.Stderr, "anneal: reusing existing WARC %s (use --recrawl to fetch again)\n", existing)
+		warcPath = existing
+	} else {
+		removeWARC(warcBase)
+		fmt.Fprintf(os.Stderr, "anneal: crawling %s\n", normURL)
+		warcPath, err = crawlSite(CrawlOptions{
+			Origin:       normURL,
+			WarcBase:     warcBase,
+			Scratch:      dir,
+			Seeds:        seeds,
+			IgnoreRobots: ignoreRobots,
+		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "anneal: %v\n", err)
+			fmt.Fprintf(os.Stderr, "anneal: crawl failed: %v\n", err)
 			return 1
 		}
-		defer os.RemoveAll(dir)
-	} else if err := os.MkdirAll(dir, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "anneal: %v\n", err)
-		return 1
-	}
-
-	warcBase := filepath.Join(dir, "site")
-
-	fmt.Fprintf(os.Stderr, "anneal: crawling %s\n", normURL)
-	if err := crawlSite(CrawlOptions{
-		Origin:       normURL,
-		WarcBase:     warcBase,
-		Scratch:      dir,
-		Seeds:        seeds,
-		IgnoreRobots: ignoreRobots,
-	}); err != nil {
-		fmt.Fprintf(os.Stderr, "anneal: crawl failed: %v\n", err)
-		return 1
-	}
-	warcPath := warcBase + ".warc.gz"
-	if _, err := os.Stat(warcPath); err != nil {
-		fmt.Fprintf(os.Stderr, "anneal: crawl produced no WARC at %s\n", warcPath)
-		return 1
 	}
 
 	mime, err := loadMime(mimePath)
@@ -191,22 +220,12 @@ func runPipeline(args []string) int {
 		return 1
 	}
 
-	// Keep the WARC: it is the audit trail (SPIDER.md §14).
-	if !noWarc {
-		dest := warcDest
-		if dest == "" {
-			dest = filepath.Join(out, "site.warc.gz")
-		}
-		if dest != warcPath {
-			if err := copyFile(warcPath, dest); err != nil {
-				fmt.Fprintf(os.Stderr, "anneal: keeping WARC: %v\n", err)
-			}
-		}
-	}
-
 	fmt.Fprintf(os.Stderr,
 		"anneal: done - %d stored, %d skipped, %d map entries, %d redirects\n",
 		res.Stored, res.Skipped, len(res.Mapped), len(res.Redirects))
+	if !noWarc {
+		fmt.Fprintf(os.Stderr, "anneal: warc: %s\n", warcPath)
+	}
 	fmt.Fprintf(os.Stderr, "anneal: report: %s\n", filepath.Join(out, "report.md"))
 
 	if len(res.Unmapped) > 0 {
@@ -258,13 +277,10 @@ func safeWipe(dir string) error {
 	return os.RemoveAll(dir)
 }
 
-func copyFile(src, dst string) error {
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-	b, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(dst, b, 0o644)
+// warcBaseFor turns a requested WARC filename into the base wget expects: wget
+// appends ".warc.gz" (or ".warc"). "--warc site.warc.gz" -> base "site".
+func warcBaseFor(dest string) string {
+	dest = strings.TrimSuffix(dest, ".gz")
+	dest = strings.TrimSuffix(dest, ".warc")
+	return dest
 }

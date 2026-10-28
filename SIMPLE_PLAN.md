@@ -23,15 +23,15 @@ example.com/
 ```
 
 That is the whole layout, so a site can be copied, moved, served or deleted as a
-unit. `--db` renames the database and `--site` moves the tree, when you want
-either somewhere else.
+unit. `--db` renames the database and `--site` moves the tree, if you want them
+somewhere else.
 
 One binary, `anneal`. Crawling and rewriting run at different times, so they are
 separate commands:
 
 ```
 anneal crawl --seed URL   # repeatable; spider, fetch, place, record
-anneal rewrite             # the pass over public/
+anneal rewrite            # the pass over public/, reading site.db for page URLs
 ```
 
 `--seed` is repeatable, for entry points the homepage does not link — a section
@@ -52,10 +52,17 @@ than `--delay`, and stops adding work at `--max-urls`. A request is tried three
 times with backoff; if it still fails the row is marked
 `ignored = 'unreachable'` and is not retried on the next run.
 
-A re-run never deletes anything: a target fetched again overwrites its file, and
-`--clean` empties `public/` before starting. Orphans cannot accumulate — a file is
-written only for a target whose row exists, and a crash between the two leaves no
-row, so the next run fetches the target again and rewrites the same path.
+A re-run never deletes anything: a target fetched again overwrites its file.
+`--clean` is the reset — it deletes `site.db` (and the `-wal`/`-shm` files beside
+it) and empties `public/` before starting, so the run begins with no memory of the
+last one. Without it the database decides: rows still pending are fetched,
+completed rows are left alone.
+
+Orphans cannot accumulate, because the writes have one order: the row is inserted
+at discovery, the body is written next, `file` and `status` are recorded last. A
+crash loses at most the body, never the row, so the next run fetches the target
+again and writes the same path. No file exists without a row, and no row claims a
+file it does not have.
 
 ## 1. The database
 
@@ -103,9 +110,12 @@ SELECT target FROM urls WHERE status IS NULL AND ignored IS NULL;
 `status`, `empty`, `conflict`, `unreachable`, or `NULL` when the body is in
 `public/`.
 
-Targets dropped before the request is made — off-host, or a `mailto:`/`data:`
-scheme — get no row at all. There is nothing to resume and nothing to report.
-Everything else keeps one, so a second run does not rediscover it.
+Targets dropped before the request is made for being off-host or non-HTTP get no
+row at all: there is nothing to resume and nothing to report. Everything else
+keeps one, `--exclude` and the query cap included, so a second run does not
+rediscover it — which makes an exclusion sticky. Removing the flag does not
+un-exclude anything already recorded; delete those rows, or start over with
+`--clean`.
 
 A redirect records where it ended in `response_target`, but the body belongs to
 the target that was asked for, because that is the URL the page linked to. If the
@@ -169,8 +179,8 @@ Everything else 404s, because the file is not at that path:
 
 `/index.php` is stored separately from `/`, so a PHP homepage ends up as two
 files with the same bytes — the price of every URL keeping its own name. Every
-rename is recorded in `urls.file`; the rewrite can work from the filesystem alone
-and consults that column only for the ambiguous cases.
+rename is recorded in `urls.file`, which the rewrite reads for one thing only:
+which URL each page answers.
 
 The files a rewrite is applied to are the ones that can contain a link —
 `.html`, `.css`, `.js`, `.json`, `.xml`, `.svg`. Images, fonts and other binaries
@@ -180,7 +190,7 @@ are never opened.
 
 | condition | verdict |
 |---|---|
-| link is `mailto:`, `javascript:`, `data:`, `ftp:` | drop, no row |
+| scheme is not `http`/`https` — `mailto:`, `javascript:`, `data:`, `ftp:`, `tel:` | drop, no row |
 | different host from the origin | drop, no row |
 | matches `--exclude` | drop, row `ignored = 'exclude'` |
 | more than `--max-queries-per-path` (1,000) distinct queries on one path | drop, row `ignored = 'query-cap'` |
@@ -188,11 +198,28 @@ are never opened.
 | body is empty | row `ignored = 'empty'` |
 | everything else | placed in `public/` |
 
-Discovery follows `href` on `<a>` and `<link>`, `src` on `<script>` and `<img>`,
-each candidate in `srcset`, `url()` in CSS, and `sitemap.xml` — the same places
-the rewrite handles. A `<form>` is not followed, and neither is a URL built in
-JavaScript: the rewrite cannot fix those either, so crawling them only adds rows
-that 404.
+### What counts as a link
+
+One inventory, used by both the spider and the rewrite: every URL found in these
+places is discovered, and rewritten in the same place.
+
+| where | what |
+|---|---|
+| `<a>`, `<area>`, `<link>` | `href` |
+| `<script>`, `<img>`, `<iframe>`, `<frame>`, `<embed>`, `<source>`, `<track>`, `<audio>`, `<video>`, `<input type="image">` | `src` |
+| `<img>`, `<source>` | `srcset`, `data-srcset` |
+| `<link rel="preload">` | `imagesrcset` |
+| `<video>` | `poster` |
+| `<object>` | `data` |
+| lazy-loading markup | `data-src`, `data-original` |
+| `<meta http-equiv="refresh">` | the URL in `content` |
+| `style` attribute, `<style>` element, `.css` | `url(…)` and `@import "…"` |
+| `sitemap.xml` | `<loc>` |
+| `.js`, `.json` | a string literal that is entirely a URL |
+
+Two deliberate omissions: `<form action>`, because a POST target is not a static
+file, and any URL assembled at runtime — `fetch('/api?x=' + v)`, a template
+literal — because it does not exist as text until the browser builds it.
 
 Fragments are stripped before anything else happens: `#top` and `/page#top` both
 mean `/page`, and a fragment-only link is not a target at all. An empty query
@@ -214,18 +241,60 @@ That is the whole trick: if the file on disk has the right extension, nginx
 serves the right MIME type and nothing has to run.
 
 **Content-Type to extension.** Strip everything from the first `;`, so
-`text/html; charset=UTF-8` is `text/html`. Look the type up in the reverse of
-`nginx/mime.types` and take the shortest extension, breaking ties alphabetically,
-so the choice does not depend on map iteration order. A type with no extension —
-including a missing `Content-Type` and `application/octet-stream` — gets `.bin`,
-and §4 sets `default_type application/octet-stream` so those download rather than
-render as `text/plain`.
+`text/html; charset=UTF-8` is `text/html`, and lowercase what is left. The
+extension is the first of:
+
+1. the preferred extension below;
+2. the first extension `nginx/mime.types` lists for that type — file order, which
+   is nginx's own idea of canonical;
+3. `.bin`.
+
+| type | ext | type | ext |
+|---|---|---|---|
+| text/html | html | image/svg+xml | svg |
+| text/css | css | image/jpeg | jpg |
+| application/javascript, text/javascript | js | image/png | png |
+| application/json | json | image/gif | gif |
+| text/plain | txt | image/webp | webp |
+| text/xml, application/xml | xml | image/avif | avif |
+| application/xhtml+xml | xhtml | image/x-icon | ico |
+| text/csv | csv | font/woff2 | woff2 |
+| text/markdown | md | font/woff | woff |
+| application/rss+xml | rss | font/ttf | ttf |
+| application/atom+xml | atom | font/otf | otf |
+| application/pdf | pdf | audio/mpeg | mp3 |
+| application/wasm | wasm | video/mp4 | mp4 |
+| application/zip | zip | video/webm | webm |
+| application/octet-stream | bin | | |
+
+The rule cannot be "the shortest extension", which is what a reverse map suggests:
+`nginx/mime.types` lists `text/html` as `htm html shtml` and `application/json` as
+`json map`, so the shortest would give `index.htm` and `data/index.map`. The table
+pins the types a site is actually made of and leaves the rest to nginx's order.
+
+Two rows list a pair rather than one type, because servers disagree about which
+name to send: `application/javascript`/`text/javascript` and
+`text/xml`/`application/xml`. Without that, a `.js` served as `text/javascript`
+would be kept as `app.js.es` — the one extension the map has for that type.
+
+A type with no extension at all — including a missing `Content-Type` — gets
+`.bin`, and §4 sets `default_type application/octet-stream` so those download
+rather than render as `text/plain`.
+
+**The path.** With the extension known, the file name follows four rules:
 
 1. Ends in `/` → `index.<ext>` in that directory.
-2. Last segment's extension already matches the `Content-Type` → natural path.
+2. Last segment's extension maps to the same `Content-Type` in `nginx/mime.types`
+   → natural path.
 3. No extension → `index.<ext>` inside a directory named after the segment.
 4. An extension that doesn't match → the segment with the real extension
    appended: `/theme.php` → `theme.php.css`, `/index.php` → `index.php.html`.
+
+"Maps to the same type" is the test that matters, because it is nginx that serves
+the file: an extension is kept only when nginx's own table turns it back into the
+type the origin sent. The comparison is case-insensitive — nginx lowercases the
+extension before looking it up (measured) — so `/LOGO.PNG` keeps its spelling and
+still serves as `image/png`.
 
 | URL | Content-Type | file | rule |
 |---|---|---|---|
@@ -340,39 +409,49 @@ either — the link lives in a page that was written minutes earlier, and the pa
 linking to it may be fetched after it. There is no moment during the crawl when a
 link and its target are both known.
 
-So rewriting is a separate pass, after the fetch phase, and it needs no database
-lookup: the filename is derived from the target, so the file itself is the
-answer.
+So rewriting is a separate pass, after the fetch phase. Filenames are derived from
+targets, so for every link the file on disk is the answer; the one thing it
+cannot answer is which URL a file was reached at.
 
 The pass walks `public/` — `.html`, `.css`, `.js`, `.json`, `.xml`, `.svg` — parses
 each file, resolves every link against the page's own URL, and looks up the
-target on disk. That URL comes from the row whose `file` is this path, because
-`bla/index.html` may have been reached at `/bla` or at `/bla/`, and `?page=2`
-resolves differently from each. Without a database, assume the trailing-slash
-form.
+target on disk. That URL comes from the row whose `file` is this path: a relative
+link in `bla/index.html` means `/x` if the page was reached at `/bla`, and
+`/bla/x` if at `/bla/`.
+
+When several rows share the file, the trailing-slash one wins — `/bla/` is the
+form a directory index is published at. With no database beside the tree, assume
+that form for every directory.
 
 | target | look for |
 |---|---|
 | `/css/site.css` (honest extension) | `css/site.css` itself |
-| `/data` (no extension) | `data/index.*` |
-| `/style.php` (lying extension) | `style.php.*` |
-| `/index.php?id=42` | `index.php.2a553fd53e66b69f.*` |
+| `/data` (no extension) | `data/index.<ext>` |
+| `/style.php` (lying extension) | `style.php.<ext>` |
+| `/index.php?id=42` | `index.php.2a553fd53e66b69f.<ext>` |
 
-Found where the plain config already serves that target — `file` equals the
-target, or equals `<target>/index.html` — and nothing changes. That second case
-is why `/bla` and `/bla/` keep working without an edit: `bla/index.html` is
-already the answer. Found anywhere else, and the link is rewritten to `/<file>`.
-Not found at all, and it is left alone, because the URL was never stored and
-would 404 either way.
+The `<ext>` is the real extension, decided when the file was written. A query adds
+one more thing in front of it: the 16 hex characters of the hash. That is what
+keeps the two shapes apart — `data/index.json` is `/data/`, while
+`data/index.2a553fd53e66b69f.json` is `/data/?id=42` — so a plain target matches
+`index.<ext>` with no hash, and a query target matches `<base>.<hash>.<ext>` and
+nothing else.
+
+Found where the plain config already serves that target, and nothing changes: the
+file is the target without its leading slash, or the target with `index.html`
+under it. So `/css/site.css` is its own file, and `/`, `/bla` and `/bla/` are
+already `index.html` and `bla/index.html`. Found anywhere else, and the link is
+rewritten to `/<file>`. Not found at all, and it is left alone, because the URL
+was never stored and would 404 either way.
 
 Directory listings are read once and cached, so this is one `readdir` per
 directory, not a `stat` per extension. With 1574 extensions in `nginx/mime.types`,
 iterating the list per link would be billions of syscalls.
 
-A target with a query is looked up by computing the same hash — base, `.`,
-`sha256(query)[:16]` — and prefix-matching that, which cannot collide with
-anything. For an extensionless target, never prefix-match: `x.` would match
-`x.html`, which belongs to `/x.html`, and `/x` is served from `x/index.html`.
+A target with a query is looked up by computing the name it must have — base,
+`.`, `sha256(query)[:16]`, `.` — and matching that prefix, the extension being
+whatever is on disk. For an extensionless target, never look for `x.*`: `x.html`
+belongs to `/x.html`, and `/x` is served from `x/index.html`.
 
 The filesystem cannot resolve everything: `/x` and `/x/` both land on
 `x/index.html`, so an `index.json` beside it would never be served at all. That is
@@ -395,21 +474,27 @@ the `bla/` directory rather than inside it, so a relative link would have to
 climb out (`../bla.bc7c7eb0ad0afdec.html`). Root-absolute assumes the tree is
 served at the root, which §4 does.
 
-**Where it applies.** Same-origin literals, and only inside the attribute, the
-`url()`, or the XML text they belong to — never a regex over the whole document:
+**Where it applies.** Same-origin literals, in the places §2 inventories, and only
+inside the attribute, the `url()`, or the XML text they belong to — never a regex
+over the whole document:
 
 | where | becomes |
 |---|---|
-| `href`, `src` | `/index.php?id=42` → `/index.php.2a553fd53e66b69f.html` |
-| `srcset`, `poster`, `data-src` | each candidate URL, resolved the same way |
+| `href`, `src`, `poster`, `data` | `/index.php?id=42` → `/index.php.2a553fd53e66b69f.html` |
+| `srcset`, `data-srcset`, `imagesrcset` | each candidate URL, resolved the same way |
+| `data-src`, `data-original` | the same as `src` |
 | `<meta http-equiv="refresh" content="0;url=…">` | the URL part |
-| CSS `url()` | `bg.php?v=3` → `/bg.php.951eba4f02508cd8.css` |
+| CSS `url()`, `@import "…"` | `bg.php?v=3` → `/bg.php.951eba4f02508cd8.css` |
 | `<loc>` in `sitemap.xml` | rewritten the same way |
 | a quoted string in `.js` or `.json` | only when the whole literal is a URL |
 
-Left alone on purpose: `<form action>` — a POST target is not a static file, and
-rewriting it turns a working form into a 404 — and `<link rel="canonical">`,
-which names the original page rather than a file here.
+A fragment survives the rewrite: `/page#top` is discovered as `/page` and comes
+back as `/page.html#top`.
+
+`<link rel="canonical">` is the one URL discovered and never rewritten, because it
+names the original page rather than a file here — on a mirror it points at a
+moved URL either way. `<form action>` is neither discovered nor rewritten: a POST
+target is not a static file, and rewriting it turns a working form into a 404.
 
 In `.js` and `.json`, a URL is replaced only when the entire string literal is
 one — `"/index.php?id=42"` or `'/index.php?id=42'`. Inside a concatenation, a
@@ -432,6 +517,8 @@ do not, and no amount of crawling changes that.
 ## 4. Serving
 
 ```nginx
+events {}
+
 http {
     include /srv/nginx/mime.types;   # the complete map from this repo
     types_hash_max_size 4096;
@@ -467,7 +554,7 @@ is unreachable no matter what the row says. Placement therefore treats it as a
 conflict (`ignored = 'conflict'`) rather than pretending the database fixes it.
 
 What it cannot do is serve a moved URL at its original path. `/index.php`,
-`/style.php` and `/data` are 404 against this config (measured, §1), and no
+`/style.php` and `/data` are 404 against this config (measured), and no
 `try_files` line fixes them: the file is not at that path, and the only index the
 config knows how to find inside a directory is `index.html`. That is what the
 rewrite pass is for — after it, no page in the tree links to a moved URL. A

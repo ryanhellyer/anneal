@@ -62,7 +62,7 @@ func runVerify(args []string) int {
 		if got := hex.EncodeToString(sum[:]); got != e.SHA256 {
 			failures = append(failures, fmt.Sprintf("%s: body sha256 %s, want %s", e.URL, got, e.SHA256))
 		}
-		if normalizeMediaType(ct) != normalizeMediaType(e.CT) {
+		if normalizeType(ct) != normalizeType(e.CT) {
 			failures = append(failures, fmt.Sprintf("%s: Content-Type %q, want %q", e.URL, ct, e.CT))
 		}
 		if strings.HasSuffix(e.URL, "/") && status == 403 {

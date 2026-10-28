@@ -112,9 +112,21 @@ func loadMime(path string) (*MimeTable, error) {
 	return parseMimeTypes(embeddedMime), nil
 }
 
+// typeAlias maps non-standard Content-Type values real servers emit onto the
+// registered type they mean, so materialise and verify agree on them.
+var typeAlias = map[string]string{
+	"image/jpg":                "image/jpeg",
+	"image/pjpeg":              "image/jpeg",
+	"image/x-png":              "image/png",
+	"application/x-javascript": "application/javascript",
+	"text/x-javascript":        "application/javascript",
+	"application/ecmascript":   "application/javascript",
+	"text/ecmascript":          "application/javascript",
+}
+
 // extForType returns the canonical extension for a Content-Type header value.
 func (t *MimeTable) extForType(ct string) (string, bool) {
-	base := normalizeMediaType(ct)
+	base := normalizeType(ct)
 	if base == "" {
 		return "", false
 	}
@@ -138,4 +150,14 @@ func normalizeMediaType(ct string) string {
 		ct = ct[:i]
 	}
 	return strings.ToLower(strings.TrimSpace(ct))
+}
+
+// normalizeType is normalizeMediaType plus the non-standard-type aliases, so a
+// type captured from the site and the type nginx serves compare equal.
+func normalizeType(ct string) string {
+	base := normalizeMediaType(ct)
+	if alias, ok := typeAlias[base]; ok {
+		return alias
+	}
+	return base
 }

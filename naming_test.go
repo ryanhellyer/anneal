@@ -105,6 +105,18 @@ func TestResolveDestHashesLongURLs(t *testing.T) {
 	}
 }
 
+func TestSameURL(t *testing.T) {
+	if !sameURL("/robots.txt", "https://example.com/robots.txt") {
+		t.Error("absolute self-redirect should be detected as same")
+	}
+	if !sameURL("/x/", "/x/") {
+		t.Error("identical paths should be same")
+	}
+	if sameURL("/old", "/new") {
+		t.Error("different paths should not be same")
+	}
+}
+
 func TestExtForType(t *testing.T) {
 	m := parseMimeTypes(embeddedMime)
 	cases := []struct{ ct, want string }{
@@ -115,6 +127,9 @@ func TestExtForType(t *testing.T) {
 		{"application/json", "json"},
 		{"image/png", "png"},
 		{"image/jpeg", "jpg"},
+		{"image/jpg", "jpg"},               // non-standard alias
+		{"image/pjpeg", "jpg"},             // non-standard alias
+		{"application/x-javascript", "js"}, // non-standard alias
 	}
 	for _, c := range cases {
 		got, ok := m.extForType(c.ct)

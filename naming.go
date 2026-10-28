@@ -48,6 +48,15 @@ func authorityOf(target string) string {
 	return strings.ToLower(rest)
 }
 
+// sameURL reports whether a redirect target points at the same request URI
+// (a no-op redirect), comparing only path and query.
+func sameURL(requestURI, location string) bool {
+	if location == requestURI {
+		return true
+	}
+	return pathAndQuery(location) == requestURI
+}
+
 // simpleName applies the naming rule to a request URI and returns the path
 // relative to the output root, with a leading "/".
 func simpleName(requestURI, ext string) string {

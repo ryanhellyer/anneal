@@ -46,6 +46,11 @@ http {
     # generated map for URLs the chain below cannot resolve (section 2.3)
     include /etc/nginx/extra.map;
 
+    # extra.map can hold thousands of full request URIs; without these nginx
+    # logs "could not build map_hash" and every map lookup degrades.
+    map_hash_max_size 8192;
+    map_hash_bucket_size 512;
+
     server {
         listen 80;
         root /srv/static/example.com;
@@ -62,11 +67,21 @@ http {
 
         location / {
             try_files $resolved $request_uri.$ext $request_uri.html $request_uri.css
-                      $request_uri.js $request_uri.json $uri $uri/ =404;
+                      $request_uri.js $request_uri.json
+                      ${request_uri}_index.html ${request_uri}_index.css
+                      ${request_uri}_index.js ${request_uri}_index.json
+                      $uri $uri/ =404;
         }
     }
 }
 ```
+
+The `${request_uri}_index.*` candidates serve a directory URL's index file by its
+**raw** path: `${request_uri}_index.html` expands to exactly `pathname + "_index.html"`,
+the §1 naming rule. They must be present because `$uri/` matches the **decoded** path,
+so a directory URL with a percent-encoded name (`/caf%C3%A9/` → `caf%C3%A9/_index.html`
+on disk) 404s without them. `${...}` braces are required — `$request_uri_index` would
+parse as a variable named `request_uri_index`.
 
 One location block. No per-script locations, no `default_type`, no reserved namespace.
 
@@ -93,7 +108,8 @@ matched exactly, not truncated.
 | `$resolved` | explicit override from `extra.map` (§2.3) |
 | `$request_uri.$ext` | any honest extension: `/img.png` → `img.png.png`, in one `stat()` |
 | `$request_uri.html` etc. | URLs whose apparent extension lies: `/theme.php?v=3` → `$ext` is `php`, but the true type is `css` |
-| `$uri $uri/` | last resort; `$uri/` is what serves a directory URL |
+| `${request_uri}_index.html` etc. | a directory URL's raw-path index: `/caf%C3%A9/` → `caf%C3%A9/_index.html`, which `$uri/` misses because it matches the decoded path |
+| `$uri $uri/` | last resort; `$uri/` is what serves an ASCII directory URL |
 
 ### 2.1 MIME types — complete map
 

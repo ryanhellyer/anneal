@@ -103,6 +103,8 @@ http {
 
     map $request_uri $ext { "~\.(?<e>[A-Za-z0-9]{1,20})(?:\?.*)?$" $e; default ""; }
     include /path/to/nginx/extra.map;     # generated
+    map_hash_max_size 8192;               # extra.map holds thousands of URIs
+    map_hash_bucket_size 512;             # keys are full request URIs
 
     server {
         root /srv/static/example.com;
@@ -110,11 +112,18 @@ http {
         include /path/to/nginx/redirects.conf;   # generated
         location / {
             try_files $resolved $request_uri.$ext $request_uri.html $request_uri.css
-                      $request_uri.js $request_uri.json $uri $uri/ =404;
+                      $request_uri.js $request_uri.json
+                      ${request_uri}_index.html ${request_uri}_index.css
+                      ${request_uri}_index.js ${request_uri}_index.json
+                      $uri $uri/ =404;
         }
     }
 }
 ```
+
+The `${request_uri}_index.*` candidates serve percent-encoded directory URLs
+(nginx's `$uri/` uses the decoded path). The `map_hash_*` settings are required
+once `extra.map` grows past the default map-hash size.
 
 ## Tests
 

@@ -258,11 +258,20 @@ The generated fragments plug into the `PLAN.md` §2 config:
 
 ```nginx
 include /etc/nginx/extra.map;              # generated
+map_hash_max_size 8192;                    # extra.map holds thousands of URIs
+map_hash_bucket_size 512;                  # keys are full request URIs
 location / {
     try_files $resolved $request_uri.$ext $request_uri.html $request_uri.css
-              $request_uri.js $request_uri.json $uri $uri/ =404;
+              $request_uri.js $request_uri.json
+              ${request_uri}_index.html ${request_uri}_index.css
+              ${request_uri}_index.js ${request_uri}_index.json
+              $uri $uri/ =404;
 }
 ```
+
+The `${request_uri}_index.*` candidates are what serve a **percent-encoded**
+directory URL: `$uri/` matches the decoded path, so `/caf%C3%A9/` only resolves
+via `${request_uri}_index.html` (`caf%C3%A9/_index.html`, the raw §7 name).
 
 The `map` is keyed on **`$request_uri`**, not `$uri`: `$uri` has the query string
 stripped, and every residue case has a query string. This is a silent failure if you get

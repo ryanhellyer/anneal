@@ -106,7 +106,7 @@ func materialise(o MaterialiseOptions) (*MaterialiseResult, error) {
 
 		ext, ok := o.Mime.extForType(resp.ContentType)
 		if !ok {
-			res.Unmapped[normalizeMediaType(resp.ContentType)]++
+			res.Unmapped[normalizeType(resp.ContentType)]++
 			return nil
 		}
 
@@ -145,6 +145,15 @@ func materialise(o MaterialiseOptions) (*MaterialiseResult, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+
+	// A redirect whose target is the same URL is a no-op; and a URL we stored a
+	// body for must be served, not redirected, or the `location =` shadows the
+	// file and the manifest's 200 becomes a 301 (SPIDER.md §9).
+	for u, loc := range redirects {
+		if stored[u] || sameURL(u, loc) {
+			delete(redirects, u)
+		}
 	}
 
 	// Duplicate bodies: collapse only the trailing-slash variant onto the plain
